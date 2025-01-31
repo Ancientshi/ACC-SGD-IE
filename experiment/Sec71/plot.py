@@ -34,10 +34,6 @@ jaccard.append((np.intersect1d(idx1, idx2).size / np.union1d(idx1, idx2).size, n
 Kendall_tau='Kendall tau: icml, nips, proposed: %s'%(np.mean(tau, axis=0))
 Jaccard_index='Jaccard index: icml, nips, proposed: %s'%(np.mean(jaccard, axis=0))
 
-print(Kendall_tau)
-print(Jaccard_index)
-
-
 res_true = joblib.load('../shell/%s%s/%s_%s_%s/infl_true%03d.dat' % (args.datasize,corrupted_str,args.target, args.model, suffix, args.seed))
 res_icml = joblib.load('../shell/%s%s/%s_%s_%s/infl_icml%03d.dat' % (args.datasize,corrupted_str,args.target, args.model, suffix, args.seed))
 res_nips = joblib.load('../shell/%s%s/%s_%s_%s/infl_sgd%03d.dat' % (args.datasize,corrupted_str,args.target, args.model, suffix, args.seed))
@@ -60,6 +56,4 @@ plt.plot(res_true, res_true, 'k--')
 plt.tight_layout(rect=[0.05, 0.05, 1, 0.75])  
 plt.subplots_adjust(top=0.8, bottom=0.1, left=0.1, right=0.95) 
 plt.legend(['NIPS','Proposed'])
-plt.title('icml:%.8f, nips:%.8f, proposed:%.8f \n %s \n %s'%(rmse_icml, rmse_nips, rmse_proposed, Kendall_tau, Jaccard_index))
-
 plt.savefig('../shell/%s%s/%s_%s_%s/compare_%s.png' % (args.datasize,corrupted_str,args.target, args.model, suffix, j_str))
