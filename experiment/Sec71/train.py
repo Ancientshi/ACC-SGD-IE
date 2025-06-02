@@ -26,6 +26,11 @@ parser.add_argument('--batch-size', default=20, type=int, help='batch size')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
 parser.add_argument('--init', default=0, type=int, help='init params or not')
 parser.add_argument('--corrupted', default=0, type=int, help='corrupt 20% data or not')
+#corruption_sigma 0.05
+parser.add_argument('--corruption_sigma', default=0.05, type=float, help='corrupted ratio')
+#noise
+parser.add_argument('--noise', default=0, type=int, help='add noise or not')
+parser.add_argument('--noise_rate', default=0.0, type=float, help='noise rate')
 args = parser.parse_args()
 assert args.target in ['mnist', '20news', 'adult']
 assert args.model in ['logreg', 'dnn']
@@ -92,7 +97,7 @@ def settings_dnn(key):
         m = [8, 8]
         alpha = 0
         #lr, decay, num_epoch, batch_size = 0.1, False, 10, 20
-        lr, decay, num_epoch, batch_size = args.lr, False, args.epoch, args.batch_size 
+        lr, decay, num_epoch, batch_size = args.lr, True, args.epoch, args.batch_size 
         return module, (n_tr, n_val, n_test), m, alpha, (lr, decay, num_epoch, batch_size)
     elif key == '20news':
         module = NewsModule()
@@ -102,7 +107,7 @@ def settings_dnn(key):
         m = [8, 8]
         alpha = 0
         #lr, decay, num_epoch, batch_size = 0.1, False, 10, 20
-        lr, decay, num_epoch, batch_size = args.lr, False, args.epoch, args.batch_size 
+        lr, decay, num_epoch, batch_size = args.lr, True, args.epoch, args.batch_size 
         return module, (n_tr, n_val, n_test), m, alpha, (lr, decay, num_epoch, batch_size)
     elif key == 'adult':
         module = AdultModule(csv_path='../data')
@@ -112,15 +117,16 @@ def settings_dnn(key):
         m = [8, 8]
         alpha = 0
         #lr, decay, num_epoch, batch_size = 0.1, False, 10, 20 
-        lr, decay, num_epoch, batch_size = args.lr, False, args.epoch, args.batch_size 
+        lr, decay, num_epoch, batch_size = args.lr, True, args.epoch, args.batch_size 
         return module, (n_tr, n_val, n_test), m, alpha, (lr, decay, num_epoch, batch_size)
 
 def test(key, model_type, seed=0, gpu=0):
-    corrupted_str='_corrupted' if args.corrupted else ''
-    dn = './%s%s/%s_%s_%s' % (args.datasize,corrupted_str,key, model_type, suffix)
+    corrupted_str=f'_corrupted{args.corruption_sigma}' if args.corrupted else ''
+    noise_str=f'_noise{args.noise_rate}' if args.noise_rate else ''
+    dn = './%s%s%s/%s_%s_%s' % (args.datasize,corrupted_str,noise_str,key, model_type, suffix)
     fn = '%s/sgd%03d.dat' % (dn, seed)
-    if not os.path.exists(dn):
-        os.mkdir(dn)
+    #exist ok 
+    os.makedirs(dn, exist_ok=True)
     device = 'cuda:%d' % (gpu,)
     
     # fetch data
@@ -179,15 +185,16 @@ def test(key, model_type, seed=0, gpu=0):
 
                 # sgd
                 idx = idx_list[i]
-                #b = idx.size
-                idx = np.setdiff1d(idx, skip)
                 b = idx.size
+                idx = np.setdiff1d(idx, skip)
                 z = model(x_tr[idx])
                 loss = loss_fn(z, y_tr[idx])
                 for p in model.parameters():
                     loss += 0.5 * alpha * (p * p).sum()
                 optimizer.zero_grad()
                 loss.backward()
+                for p in model.parameters():
+                    p.grad.data *= idx.size / b
                 optimizer.step()
 
                 # decay

@@ -7,7 +7,8 @@ import torch
 from MyNet import LogReg, DNN, NetList
 from train import *
 import random
-import copy
+from copy import deepcopy
+from torch.func import functional_call, grad, jvp, vmap
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
@@ -29,8 +30,9 @@ def compute_gradient(x, y, model, loss_fn):
     return u
 
 def infl_true(key, model_type, seed=0, gpu=0):
-    corrupted_str='_corrupted' if args.corrupted else ''
-    dn = './%s%s/%s_%s_%s' % (args.datasize,corrupted_str,key, model_type, suffix)
+    corrupted_str=f'_corrupted{args.corruption_sigma}' if args.corruption_sigma else ''
+    noise_str=f'_noise{args.noise_rate}' if args.noise_rate else ''
+    dn = './%s%s%s/%s_%s_%s' % (args.datasize,corrupted_str,noise_str,key, model_type, suffix)
     fn = '%s/sgd%03d.dat' % (dn, seed)
     gn = '%s/infl_true%03d.dat' % (dn, seed)
     device = 'cuda:%d' % (gpu,)
@@ -73,8 +75,9 @@ def infl_true(key, model_type, seed=0, gpu=0):
 
 
 def infl_sgd(key, model_type, seed=0, gpu=0):
-    corrupted_str='_corrupted' if args.corrupted else ''
-    dn = './%s%s/%s_%s_%s' % (args.datasize,corrupted_str,key, model_type, suffix)
+    corrupted_str=f'_corrupted{args.corruption_sigma}' if args.corruption_sigma else ''
+    noise_str=f'_noise{args.noise_rate}' if args.noise_rate else ''
+    dn = './%s%s%s/%s_%s_%s' % (args.datasize,corrupted_str,noise_str,key, model_type, suffix)
     fn = '%s/sgd%03d.dat' % (dn, seed)
     gn = '%s/infl_sgd%03d.dat' % (dn, seed)
     device = 'cuda:%d' % (gpu,)
@@ -119,53 +122,43 @@ def infl_sgd(key, model_type, seed=0, gpu=0):
         m = models[t]
         m.eval()
         idx, lr = info[t]['idx'], info[t]['lr']
-        
-        z = m(x_tr[idx])
-        loss = loss_fn(z, y_tr[idx])
-        for p in m.parameters():
-            loss += 0.5 * alpha * (p * p).sum()
-        m.zero_grad()
-        grad_params = torch.autograd.grad(loss, m.parameters(), create_graph=True)
-
         for i in idx:
             z = m(x_tr[[i]])
             loss = loss_fn(z, y_tr[[i]])
             for p in m.parameters():
                 loss += 0.5 * alpha * (p * p).sum()
             m.zero_grad()
-            example_grad_params = torch.autograd.grad(loss, m.parameters())
-            batch_grad_params = grad_params
+            loss.backward()
+            for j, param in enumerate(m.parameters()):
+                infl[i] += lr * (u[j].data * param.grad.data).sum().item() / idx.size
         
-            for j in range(len(batch_grad_params)):
-                uu=u[j]
-                example_grad_param=example_grad_params[j]
-                batch_grad_param=batch_grad_params[j]
-                infl[i] += (lr/ (idx.size)) * (u[j] * (example_grad_param)).sum().item()
-                
         # update u
+        z = m(x_tr[idx])
+        loss = loss_fn(z, y_tr[idx])
+        for p in m.parameters():
+            loss += 0.5 * alpha * (p * p).sum()
+        grad_params = torch.autograd.grad(loss, m.parameters(), create_graph=True)
         ug = 0
         for uu, g in zip(u, grad_params):
             ug += (uu * g).sum()
         m.zero_grad()
         ug.backward()
         for j, param in enumerate(m.parameters()):
-            #u[j] -= lr * param.grad.data / idx.size
             u[j] -= lr * param.grad.data
         
     # save
     joblib.dump(infl, gn, compress=9)
 
-def infl_proposed(key, model_type, seed=0, gpu=0, simpj=1):
-    if simpj:
-        infl_proposed_simpj(key, model_type, seed, gpu)
-    else:
-        infl_proposed_nosimpj(key, model_type, seed, gpu)
-        
-def infl_proposed_simpj(key, model_type, seed=0, gpu=0):
-    corrupted_str='_corrupted' if args.corrupted else ''
-    dn = './%s%s/%s_%s_%s' % (args.datasize,corrupted_str,key, model_type, suffix)
+
+def infl_accumulative_sgd(key, model_type, seed=0, gpu=0):
+    corrupted_str=f'_corrupted{args.corruption_sigma}' if args.corruption_sigma else ''
+    noise_str=f'_noise{args.noise_rate}' if args.noise_rate else ''
+    dn = './%s%s%s/%s_%s_%s' % (args.datasize,corrupted_str,noise_str,key, model_type, suffix)
     fn = '%s/sgd%03d.dat' % (dn, seed)
-    gn = '%s/infl_proposed_simpj%03d.dat' % (dn, seed)
+    if args.simpj:
+        gn = '%s/infl_proposed_simpj%s_%03d.dat' % (dn,args.simpj,seed)
+    else:
+        gn = '%s/infl_proposed_nosimpj_%03d.dat' % (dn,seed)
     device = 'cuda:%d' % (gpu,)
     
     # setup
@@ -185,84 +178,100 @@ def infl_proposed_simpj(key, model_type, seed=0, gpu=0):
     y_tr = torch.from_numpy(np.expand_dims(y_tr, axis=1)).to(torch.float32).to(device)
     x_val = torch.from_numpy(x_val).to(torch.float32).to(device)
     y_val = torch.from_numpy(np.expand_dims(y_val, axis=1)).to(torch.float32).to(device)
-
-
+    
     # model setup
     res = joblib.load(fn)
     model = res['models'].models[-1].to(device)
+    #loss_fn = torch.nn.functional.nll_loss
     loss_fn = torch.nn.BCEWithLogitsLoss()
-    loss_fn_none= torch.nn.BCEWithLogitsLoss(reduction='none')
+    loss_fn_no_reduction = torch.nn.BCEWithLogitsLoss(reduction='none')
     model.eval()
-
     
     # gradient
     u = compute_gradient(x_val, y_val, model, loss_fn)
     u = [uu.to(device) for uu in u]
-
-
-    # model list 
+    u_dict = { i: [uu.detach().clone() for uu in u] for i in range(n_tr) }
+    
+    # model list
     models = res['models'].models[:-1]
-
+    
     # influence
     alpha = res['alpha']
     info = res['info']
-
     infl = np.zeros(n_tr)
     for t in range(len(models)-1, -1, -1):
         m = models[t]
         m.eval()
         idx, lr = info[t]['idx'], info[t]['lr']
-        
-        z = m(x_tr[idx])
-        loss = loss_fn(z, y_tr[idx])
-        for p in m.parameters():
-            loss += 0.5 * alpha * (p * p).sum()
-        m.zero_grad() 
-        grad_params = torch.autograd.grad(loss, m.parameters(), create_graph=True)
-        
-        z=m(x_tr[idx])
-        loss_per_list=loss_fn_none(z, y_tr[idx])
-        for p in m.parameters():
-            loss_per_list += 0.5 * alpha * (p * p).sum()
-        
         for i in idx:
             z = m(x_tr[[i]])
             loss = loss_fn(z, y_tr[[i]])
             for p in m.parameters():
                 loss += 0.5 * alpha * (p * p).sum()
             m.zero_grad()
-            
-            example_grad_params = torch.autograd.grad(loss, m.parameters(), create_graph=True)
-            batch_grad_params = grad_params
-            
-            for j in range(len(batch_grad_params)):
-                uu=u[j]
-                example_grad_param=example_grad_params[j]
-                batch_grad_param=batch_grad_params[j]
-
-                #in SGD-Influence it is as follows, we change this
-                #infl[i] += (lr/ (idx.size)) * (u[j] * (example_grad_param)).sum().item() 
-                infl[i] += (lr/ (idx.size-1)) * (u[j] * (example_grad_param-batch_grad_param)).sum().item() 
-
-        ug = 0
-        for uu, g in zip(u, grad_params):
-            ug += (uu * g).sum()
-        m.zero_grad()
-        ug_grad=torch.autograd.grad(ug, m.parameters(), create_graph=False)
+            loss.backward()
+            for j, param in enumerate(m.parameters()):
+                infl[i] += lr * (u_dict[i][j].data * param.grad.data).sum().item() / idx.size
         
-        #if simplify V_i^k, then every example share the same calculation
-        for j in range(len(u)):
-            ug_grad_param=ug_grad[j]
-            u[j] = u[j]-lr * ug_grad_param
+        
 
+        batch_size = len(idx)
+        # 1) forward: batch loss
+        z = m(x_tr[idx])
+        loss_nr = loss_fn_no_reduction(z, y_tr[idx])                  
+        loss_batch = loss_nr.mean()
+        for p in m.parameters():
+            loss_batch = loss_batch + 0.5 * alpha * (p*p).sum()
+
+        # 2)  batch gradient(create_graph=True for Hessian calculation afterwards）
+        params = list(m.parameters())
+        grads_batch = torch.autograd.grad(loss_batch, params, create_graph=True)
+
+        # 3) idx->local index mapping
+        k2loc = {int(i): loc for loc, i in enumerate(idx.tolist())}
+
+        # 4) update u for each sample k
+        for k in range(n_tr):
+            if k in k2loc:
+                # the absent sample in batch
+                loc = k2loc[k]
+                loss_i = loss_batch - loss_nr[loc] / batch_size
+                for p in params:
+                    loss_i = loss_i + 0.5 * alpha * (p*p).sum()
+                # “leave-one-out” loss gradient
+                grads_i = torch.autograd.grad(loss_i, params, create_graph=True)
+                # Hessian–vector product：H_i @ u_k
+                hvp = torch.autograd.grad(grads_i, params,
+                                        grad_outputs=u_dict[k],
+                                        retain_graph=True)
+            else:
+                # absent sample in batch
+                hvp = torch.autograd.grad(grads_batch, params,
+                                        grad_outputs=u_dict[k],
+                                        retain_graph=True)
+
+            # 5) update u_dict[k]
+            for j in range(len(u_dict[k])):
+                u_dict[k][j] = u_dict[k][j] - lr * hvp[j]
+                    
+                
+        
     # save
     joblib.dump(infl, gn, compress=9)
     
-def infl_proposed_nosimpj(key, model_type, seed=0, gpu=0):
-    corrupted_str='_corrupted' if args.corrupted else ''
-    dn = './%s%s/%s_%s_%s' % (args.datasize,corrupted_str,key, model_type, suffix)
+
+
+
+def infl_accumulative_sgd_compromised(key, model_type, seed=0, gpu=0):
+    corrupted_str=f'_corrupted{args.corruption_sigma}' if args.corruption_sigma else ''
+    noise_str=f'_noise{args.noise_rate}' if args.noise_rate else ''
+    dn = './%s%s%s/%s_%s_%s' % (args.datasize,corrupted_str,noise_str,key, model_type, suffix)
     fn = '%s/sgd%03d.dat' % (dn, seed)
-    gn = '%s/infl_proposed_nosimpj%03d.dat' % (dn, seed)
+    if args.simpj:
+        gn = '%s/infl_proposed_simpj%s_%03d.dat' % (dn,args.simpj,seed)
+    else:
+        gn = '%s/infl_proposed_nosimpj_%03d.dat' % (dn,seed)
+    
     device = 'cuda:%d' % (gpu,)
     
     # setup
@@ -282,108 +291,131 @@ def infl_proposed_nosimpj(key, model_type, seed=0, gpu=0):
     y_tr = torch.from_numpy(np.expand_dims(y_tr, axis=1)).to(torch.float32).to(device)
     x_val = torch.from_numpy(x_val).to(torch.float32).to(device)
     y_val = torch.from_numpy(np.expand_dims(y_val, axis=1)).to(torch.float32).to(device)
-
-
+    
     # model setup
     res = joblib.load(fn)
     model = res['models'].models[-1].to(device)
+    #loss_fn = torch.nn.functional.nll_loss
     loss_fn = torch.nn.BCEWithLogitsLoss()
-    loss_fn_none= torch.nn.BCEWithLogitsLoss(reduction='none')
+    loss_fn_no_reduction = torch.nn.BCEWithLogitsLoss(reduction='none')
     model.eval()
-
     
     # gradient
     u = compute_gradient(x_val, y_val, model, loss_fn)
     u = [uu.to(device) for uu in u]
-    #k,u
-    u_dict={}
-    #u
-    for i in range(n_tr):
-        u_dict[i]=[uu.clone() for uu in u]
-
-    # model list 
+    u_dict = { i: [uu.detach().clone() for uu in u] for i in range(n_tr) }
+    
+    # model list
     models = res['models'].models[:-1]
-
+    
     # influence
     alpha = res['alpha']
     info = res['info']
-
     infl = np.zeros(n_tr)
-    for t in range(len(models)-1, -1, -1):
-        m = models[t]
-        m.eval()
-        idx, lr = info[t]['idx'], info[t]['lr']
-        
-        z = m(x_tr[idx])
-        loss = loss_fn(z, y_tr[idx])
-        for p in m.parameters():
-            loss += 0.5 * alpha * (p * p).sum()
-        m.zero_grad() 
-        grad_params = torch.autograd.grad(loss, m.parameters(), create_graph=True)
-        
-        z=m(x_tr[idx])
-        loss_per_list=loss_fn_none(z, y_tr[idx])
-        for p in m.parameters():
-            loss_per_list += 0.5 * alpha * (p * p).sum()
-        
-        per_example_lossgap_grad_params_dict={}
-        for i,loss_per_example in zip(idx,loss_per_list):
-            gap_loss=loss_per_example-loss_per_list.mean()
-            m.zero_grad() 
-            per_example_lossgap_grad_params= torch.autograd.grad(gap_loss, m.parameters(), create_graph=True)
-            per_example_lossgap_grad_params_dict[i]=per_example_lossgap_grad_params
-        
-        
-        '''idx:
-        [150 151 152 153 154 155 156 157 158 159 160 161 162 163 164 165 166 167
-        168 169 170 171 172 173 174 175 176 177 178 179 180 181 182 183 184 185
-        186 187 188 189 190 191 192 193 194 195 196 197 198 199]
-        '''
-        for i in idx:
-            per_example_lossgap_grad_params = per_example_lossgap_grad_params_dict[i]
     
-            for j in range(len(per_example_lossgap_grad_params)):
-                uu=u_dict[i][j]
-                infl[i] += (lr/ (idx.size-1)) * (u_dict[i][j] * per_example_lossgap_grad_params[j]).sum().item() 
+    for t in range(len(models)-1, -1, -1):
+        if 0<=t and t<args.simpj-1:
+            m = models[t]
+            m.eval()
+            idx, lr = info[t]['idx'], info[t]['lr']
+            for i in idx:
+                z = m(x_tr[[i]])
+                loss = loss_fn(z, y_tr[[i]])
+                for p in m.parameters():
+                    loss += 0.5 * alpha * (p * p).sum()
+                m.zero_grad()
+                loss.backward()
+                for j, param in enumerate(m.parameters()):
+                    infl[i] += lr * (u_dict[i][j].data * param.grad.data).sum().item() / idx.size
+            
+            
+
+            batch_size = len(idx)
+            z = m(x_tr[idx])
+            loss_nr = loss_fn_no_reduction(z, y_tr[idx])                   # shape=(|idx|,)
+            loss_batch = loss_nr.mean()
+            for p in m.parameters():
+                loss_batch = loss_batch + 0.5 * alpha * (p*p).sum()
+
+            params = list(m.parameters())
+            grads_batch = torch.autograd.grad(loss_batch, params, create_graph=True)
+
+            k2loc = {int(i): loc for loc, i in enumerate(idx.tolist())}
+
+            for k in range(n_tr):
+                if k in k2loc:
+                    loc = k2loc[k]
+                    loss_i = loss_batch - loss_nr[loc] / batch_size
+                    for p in params:
+                        loss_i = loss_i + 0.5 * alpha * (p*p).sum()
+                    grads_i = torch.autograd.grad(loss_i, params, create_graph=True)
+                    hvp = torch.autograd.grad(grads_i, params,
+                                            grad_outputs=u_dict[k],
+                                            retain_graph=True)
+                else:
+                    hvp = torch.autograd.grad(grads_batch, params,
+                                            grad_outputs=u_dict[k],
+                                            retain_graph=True)
+
+                for j in range(len(u_dict[k])):
+                    u_dict[k][j] = u_dict[k][j] - lr * hvp[j]
+        else:
+            m = models[t]
+            m.eval()
+            idx, lr = info[t]['idx'], info[t]['lr']
+            for i in idx:
+                z = m(x_tr[[i]])
+                loss = loss_fn(z, y_tr[[i]])
+                for p in m.parameters():
+                    loss += 0.5 * alpha * (p * p).sum()
+                m.zero_grad()
+                loss.backward()
+                for j, param in enumerate(m.parameters()):
+                    infl[i] += lr * (u[j].data * param.grad.data).sum().item() / idx.size
+            
+            
+
+            batch_size = len(idx)
+            z = m(x_tr[idx])
+            loss_nr = loss_fn_no_reduction(z, y_tr[idx])                   # shape=(|idx|,)
+            loss_batch = loss_nr.mean()
+            for p in m.parameters():
+                loss_batch = loss_batch + 0.5 * alpha * (p*p).sum()
+
+            params = list(m.parameters())
+            grads_batch = torch.autograd.grad(loss_batch, params, create_graph=True)
+
+            k2loc = {int(i): loc for loc, i in enumerate(idx.tolist())}
+
+            hvp = torch.autograd.grad(grads_batch, params,
+                                    grad_outputs=u,
+                                    retain_graph=True)
+            for j in range(len(u)):
+                u[j] = u[j] - lr * hvp[j]
+
+            
+            if t == args.simpj:
+                u_dict = { i: [uu.detach().clone() for uu in u] for i in range(n_tr) }
         
-        for i in range(n_tr):
-            if i in idx:
-                ug = 0
-                for uu, g in zip(u_dict[i], grad_params):
-                    ug += (uu * g).sum()
-                m.zero_grad()
-                ug_grad=torch.autograd.grad(ug, m.parameters(), create_graph=False,retain_graph=True)
-                
-                ug2=0
-                for uu, g in zip(u_dict[i], per_example_lossgap_grad_params):
-                    ug2 += (uu * g).sum()
-                m.zero_grad()
-                ug2_grad=torch.autograd.grad(ug2, m.parameters(), create_graph=False,retain_graph=True)
-            
-                for j in range(len(u_dict[i])):
-                    ug_grad_param=ug_grad[j]
-                    ug2_grad_param=ug2_grad[j]
-                    u_dict[i][j] = u_dict[i][j]-lr * ug_grad_param + \
-                                                lr/(idx.size)* ug2_grad_param
-                
-                
-            else: 
-                ug = 0
-                for uu, g in zip(u_dict[i], grad_params):
-                    ug += (uu * g).sum()
-                m.zero_grad()
-                ug_grad=torch.autograd.grad(ug, m.parameters(), create_graph=False,retain_graph=True)
-                
-                for j in range(len(u_dict[i])):
-                    ug_grad_param=ug_grad[j]
-                    u_dict[i][j] = u_dict[i][j]-lr * ug_grad_param
-            
     # save
     joblib.dump(infl, gn, compress=9)
     
+    
+    
+def infl_proposed(args,key, model_type, seed=0, gpu=0, simpj=1):
+    if simpj:
+        infl_accumulative_sgd_compromised(key, model_type, seed, gpu)
+    else:
+        infl_accumulative_sgd(key, model_type, seed, gpu)
+     
+
+    
+    
+    
 def infl_nohess(key, model_type, seed=0, gpu=0):
-    corrupted_str='_corrupted' if args.corrupted else ''
-    dn = './%s%s/%s_%s_%s' % (args.datasize,corrupted_str,key, model_type, suffix)
+    corrupted_str=f'_corrupted{args.corruption_sigma}' if args.corruption_sigma else ''
+    noise_str=f'_noise{args.noise_rate}' if args.noise_rate else ''
+    dn = './%s%s%s/%s_%s_%s' % (args.datasize,corrupted_str,noise_str,key, model_type, suffix)
     fn = '%s/sgd%03d.dat' % (dn, seed)
     gn = '%s/infl_nohess%03d.dat' % (dn, seed)
     device = 'cuda:%d' % (gpu,)
@@ -442,8 +474,9 @@ def infl_nohess(key, model_type, seed=0, gpu=0):
     
 
 def infl_icml(key, model_type, seed=0, gpu=0):
-    corrupted_str='_corrupted' if args.corrupted else ''
-    dn = './%s%s/%s_%s_%s' % (args.datasize,corrupted_str,key, model_type, suffix)
+    corrupted_str=f'_corrupted{args.corruption_sigma}' if args.corruption_sigma else ''
+    noise_str=f'_noise{args.noise_rate}' if args.noise_rate else ''
+    dn = './%s%s%s/%s_%s_%s' % (args.datasize,corrupted_str,noise_str,key, model_type, suffix)
     fn = '%s/sgd%03d.dat' % (dn, seed)
     gn = '%s/infl_icml%03d.dat' % (dn, seed)
     hn = '%s/loss_icml%03d.dat' % (dn, seed)
@@ -556,10 +589,10 @@ if __name__ == '__main__':
                 infl_sgd(args.target, args.model, seed, args.gpu)
     elif args.type == 'proposed':
         if args.seed >= 0:
-            infl_proposed(args.target, args.model, args.seed, args.gpu, args.simpj)
+            infl_proposed(args,args.target, args.model, args.seed, args.gpu, args.simpj)
         else:
             for seed in range(100):
-                infl_proposed(args.target, args.model, seed, args.gpu, args.simpj)
+                infl_proposed(args,args.target, args.model, seed, args.gpu, args.simpj)
     elif args.type == 'nohess':
         if args.seed >= 0:
             infl_nohess(args.target, args.model, args.seed, args.gpu)

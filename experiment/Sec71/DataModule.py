@@ -8,7 +8,7 @@ from sklearn.datasets import fetch_20newsgroups
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-import torchvision 
+import torchvision
 import torchvision.transforms as transforms
 
 
@@ -49,115 +49,208 @@ def native(country):
     else:
         return country
 
+# ------------------------
+# Helper functions
+# ------------------------
 
+def apply_input_corruption(x: np.ndarray, sigma: float = 0.1) -> np.ndarray:
+    """
+    Add Gaussian noise to features (or pixel values) for corruption.
+    """
+    noise = np.random.normal(loc=0.0, scale=sigma, size=x.shape)
+    return x + noise
+
+def apply_input_corruption_nlp(x: np.ndarray, sigma: float = 0.1) -> np.ndarray:
+    """
+    Add Gaussian noise to features (or pixel values) for corruption.
+    """
+    n_samples = x.shape[0]
+    n_features = x.shape[1]
+    n_noisy = int(n_features * sigma)
+    if n_noisy <= 0:
+        return x
+    x_noisy = x.copy()
+    for i in range(n_samples):
+        idx = np.random.choice(n_features, n_noisy, replace=False)
+        x_noisy[i, idx] = 1
+    return x_noisy
+
+
+
+def apply_label_noise(y: np.ndarray, noise_rate: float = 0.1,seed: int = 0) -> np.ndarray:
+    """
+    Randomly flip labels at the specified noise_rate.
+    """
+    y_noisy = y.copy()
+    n_tr = y_noisy.shape[0]
+    np.random.seed(seed)
+    ratio=noise_rate
+    random_index_list=np.random.choice(n_tr,int(n_tr*ratio),replace=False)
+    y_noisy[random_index_list]=1-y_noisy[random_index_list]   
+    return y_noisy
+
+
+# ------------------------
+# Base DataModule
+# ------------------------
 class DataModule:
-    def __init__(self, normalize=True, append_one=True):
+    def __init__(
+        self,
+        normalize: bool = True,
+        append_one: bool = True
+    ):
         self.normalize = normalize
         self.append_one = append_one
-    
-    def load(self):
-        pass
-    
-    def fetch(self, n_tr, n_val, n_test, seed=0,args=None):
+
+    def load(self) -> Tuple[np.ndarray, np.ndarray]:
+        raise NotImplementedError
+
+    def fetch(
+        self,
+        n_tr: int,
+        n_val: int,
+        n_test: int,
+        seed: int = 0,
+        args: Any = None,
+    ) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
         x, y = self.load()
-        
-        # split data
+        # split
         x_tr, x_val, y_tr, y_val = train_test_split(
-            x, y, train_size=n_tr, test_size=n_val+n_test, random_state=seed)
+            x, y, train_size=n_tr, test_size=n_val + n_test, random_state=seed
+        )
         x_val, x_test, y_val, y_test = train_test_split(
-            x_val, y_val, train_size=n_val, test_size=n_test, random_state=seed+1)
-        
-        # process x
+            x_val, y_val, train_size=n_val, test_size=n_test, random_state=seed + 1
+        )
+
+        # apply corruption on training inputs
+        if args.corrupted:
+            if args.target == '20news':
+                x_tr = apply_input_corruption_nlp(x_tr, sigma=args.corruption_sigma)
+            else:
+                x_tr = apply_input_corruption(x_tr, sigma=args.corruption_sigma)
+
+        # apply label noise on training labels
+        if args.noise:
+            y_tr = apply_label_noise(y_tr, noise_rate=args.noise_rate,seed=args.seed)
+
+        # normalize
         if self.normalize:
             scaler = StandardScaler()
             scaler.fit(x_tr)
             x_tr = scaler.transform(x_tr)
             x_val = scaler.transform(x_val)
             x_test = scaler.transform(x_test)
+
+        # append bias term
         if self.append_one:
-            x_tr = np.c_[x_tr, np.ones(n_tr)]
-            x_val = np.c_[x_val, np.ones(n_val)]
-            x_test = np.c_[x_test, np.ones(n_test)]
-        
-        if args.corrupted:
-            ratio=0.02
-            random_index_list=np.random.choice(n_tr,int(n_tr*ratio),replace=False)
-            y_tr[random_index_list]=1-y_tr[random_index_list]       
+            x_tr = np.c_[x_tr, np.ones(x_tr.shape[0])]
+            x_val = np.c_[x_val, np.ones(x_val.shape[0])]
+            x_test = np.c_[x_test, np.ones(x_test.shape[0])]
 
         return (x_tr, y_tr), (x_val, y_val), (x_test, y_test)
-        
 
+
+# ------------------------
+# MNIST Module
+# ------------------------
 class MnistModule(DataModule):
-    def __init__(self, normalize=True, append_one=False):
-        DataModule.__init__(self, normalize, append_one)
+    def __init__(
+        self,
+        normalize: bool = True,
+        append_one: bool = False
+    ):
+        super().__init__(
+            normalize,
+            append_one
+        )
         from tensorflow.examples.tutorials.mnist import input_data
         self.input_data = input_data
-    
-    def load(self):
+
+    def load(self) -> Tuple[np.ndarray, np.ndarray]:
         mnist = self.input_data.read_data_sets('/tmp/data/', one_hot=True)
         ytr = mnist.train.labels
         xtr = mnist.train.images
-        xtr1 = xtr[ytr[:, 1]>0, :]
-        xtr7 = xtr[ytr[:, 7]>0, :]
-        x = np.r_[xtr1, xtr7]
-        y = np.r_[np.zeros(xtr1.shape[0]), np.ones(xtr7.shape[0])]
+        # binary classification: digits 1 vs 7
+        xtr1 = xtr[ytr[:, 1] > 0]
+        xtr7 = xtr[ytr[:, 7] > 0]
+        x = np.vstack([xtr1, xtr7])
+        y = np.concatenate([
+            np.zeros(xtr1.shape[0], dtype=int),
+            np.ones(xtr7.shape[0], dtype=int),
+        ])
         return x, y
 
-    
+
+# ------------------------
+# News Module
+# ------------------------
 class NewsModule(DataModule):
-    def __init__(self, normalize=True, append_one=False):
-        DataModule.__init__(self, normalize, append_one)
-    
-    def load(self):
+    def __init__(
+        self,
+        normalize: bool = True,
+        append_one: bool = False
+    ):
+        super().__init__(
+            normalize,
+            append_one
+        )
+
+    def load(self) -> Tuple[np.ndarray, np.ndarray]:
         categories = ['comp.sys.ibm.pc.hardware', 'comp.sys.mac.hardware']
-        newsgroups_train = fetch_20newsgroups(
-            subset='train', remove=('headers', 'footers', 'quotes'), categories=categories)
-        newsgroups_test = fetch_20newsgroups(
-            subset='test', remove=('headers', 'footers', 'quotes'), categories=categories)
-        vectorizer = TfidfVectorizer(stop_words='english', min_df=0.001, max_df=0.20)
-        vectors = vectorizer.fit_transform(newsgroups_train.data)
-        vectors_test = vectorizer.transform(newsgroups_test.data)
-        x1 = vectors
-        y1 = newsgroups_train.target
-        x2 = vectors_test
-        y2 = newsgroups_test.target
-        x = np.array(np.r_[x1.todense(), x2.todense()])
-        y = np.r_[y1, y2]
+        train = fetch_20newsgroups(
+            subset='train', remove=('headers','footers','quotes'), categories=categories
+        )
+        test = fetch_20newsgroups(
+            subset='test', remove=('headers','footers','quotes'), categories=categories
+        )
+        vec = TfidfVectorizer(stop_words='english', min_df=0.001, max_df=0.2)
+        x_tr = vec.fit_transform(train.data).toarray()
+        x_test = vec.transform(test.data).toarray()
+        x = np.vstack([x_tr, x_test])
+        y = np.concatenate([train.target, test.target])
         return x, y
 
 
+# ------------------------
+# Adult Module
+# ------------------------
 class AdultModule(DataModule):
-    def __init__(self, normalize=True, append_one=False, csv_path='../data'):
-        DataModule.__init__(self, normalize, append_one)
+    def __init__(
+        self,
+        normalize: bool = True,
+        append_one: bool = False,
+        csv_path: str = '../data'
+    ):
+        super().__init__(
+            normalize,
+            append_one
+        )
         self.csv_path = csv_path
-        
-    def load(self):
-        train = pd.read_csv('%s/adult-training.csv' % (self.csv_path,), names=columns)
-        test = pd.read_csv('%s/adult-test.csv' % (self.csv_path,), names=columns, skiprows=1)
+
+    def load(self) -> Tuple[np.ndarray, np.ndarray]:
+        cols = ['Age','Workclass','fnlgwt','Education','Education num',
+                'Marital Status','Occupation','Relationship','Race','Sex',
+                'Capital Gain','Capital Loss','Hours/Week','Native country','Income']
+        train = pd.read_csv(f'{self.csv_path}/adult-training.csv', names=cols)
+        test = pd.read_csv(f'{self.csv_path}/adult-test.csv', names=cols, skiprows=1)
         df = pd.concat([train, test], ignore_index=True)
 
-        # preprocess
+        # basic cleaning
         df.replace(' ?', np.nan, inplace=True)
-        df['Income'] = df['Income'].apply(lambda x: 1 if x in (' >50K', ' >50K.') else 0)
-        df['Workclass'].fillna(' 0', inplace=True)
-        df['Workclass'].replace(' Without-pay', ' Never-worked', inplace=True)
+        df['Income'] = df['Income'].apply(lambda x: 1 if x.strip().startswith('>50K') else 0)
         df['fnlgwt'] = df['fnlgwt'].apply(lambda x: np.log1p(x))
         df['Education'] = df['Education'].apply(primary)
-        df['Marital Status'].replace(' Married-AF-spouse', ' Married-civ-spouse', inplace=True)
-        df['Occupation'].fillna(' 0', inplace=True)
-        df['Occupation'].replace(' Armed-Forces', ' 0', inplace=True)
+        df['Marital Status'].replace(' Married-AF-spouse',' Married-civ-spouse', inplace=True)
         df['Native country'].fillna(' 0', inplace=True)
         df['Native country'] = df['Native country'].apply(native)
 
-        # one-hot encoding
-        categorical_features = df.select_dtypes(include=['object']).axes[1]
-        for col in categorical_features:
-            df = pd.concat([df, pd.get_dummies(df[col], prefix=col, prefix_sep=':')], axis=1)
+        # one-hot encode categoricals
+        cat_cols = df.select_dtypes(include=['object']).columns
+        for col in cat_cols:
+            dummies = pd.get_dummies(df[col], prefix=col)
+            df = pd.concat([df, dummies], axis=1)
             df.drop(col, axis=1, inplace=True)
-        
-        # data
-        x = df.drop(['Income'], axis=1).values
+
+        x = df.drop('Income', axis=1).values
         y = df['Income'].values
         return x, y
-
-        
